@@ -8,14 +8,18 @@ from PyQt5.QtCore import QPointF, QRectF, Qt
 from PyQt5.QtGui import QColor, QPainter, QPainterPath, QPen
 from PyQt5.QtWidgets import QWidget
 
+import theme
+
 
 class Trend(QWidget):
-    def __init__(self, title, unit, accent, target=False):
+    def __init__(self, title, unit, curve, target=False, target_name="目标"):
         super().__init__()
         self.title = title
         self.unit = unit
-        self.accent = QColor(accent)
+        self.curve = curve  # 主题曲线色序号
         self.has_target = target
+        self.target_name = target_name
+        theme.bus.changed.connect(lambda _: self.update())
         self.points = deque(maxlen=6000)
         self.window = 10
         self.setMinimumHeight(142)
@@ -52,17 +56,20 @@ class Trend(QWidget):
         painter.setFont(font)
         painter.scale(self.zoom, self.zoom)
         width, height = self.width() / self.zoom, self.height() / self.zoom
-        painter.setPen(QPen(QColor("#dce5ef")))
-        painter.setBrush(QColor("#ffffff"))
+        look = theme.current()
+        pal = look.pal
+        accent = QColor(pal.curves[self.curve % len(pal.curves)])
+        painter.setPen(QPen(QColor(pal.border)))
+        painter.setBrush(look.color("card"))
         painter.drawRoundedRect(QRectF(0.5, 0.5, width - 1, height - 1), 12, 12)
         title_font = painter.font()
         title_font.setBold(True)
         painter.setFont(title_font)
-        painter.setPen(QColor("#182a40"))
+        painter.setPen(QColor(pal.text))
         painter.drawText(QRectF(16, 9, width - 32, 22), Qt.AlignLeft | Qt.AlignVCenter, self.title)
         title_font.setBold(False)
         painter.setFont(title_font)
-        painter.setPen(self.accent)
+        painter.setPen(accent)
         last = self.points[-1][1] if self.points else None
         value_text = f"{last:.2f} {self.unit}" if last is not None else f"—  {self.unit}"
         painter.drawText(QRectF(16, 9, width - 32, 22), Qt.AlignRight | Qt.AlignVCenter, value_text)
@@ -76,8 +83,8 @@ class Trend(QWidget):
         spread = max(high - low, abs(high) * 0.02, 0.05)
         center = (low + high) / 2
         low, high = center - spread * 0.6, center + spread * 0.6
-        grid = QColor("#e8edf4")
-        muted = QColor("#687b92")
+        grid = QColor(pal.grid)
+        muted = QColor(pal.muted)
         painter.setFont(painter.font())
         for index in range(4):
             y = plot.top() + plot.height() * index / 3
@@ -106,6 +113,7 @@ class Trend(QWidget):
             )
 
         painter.save()
+        painter.setBrush(Qt.NoBrush)
         painter.setClipRect(plot.adjusted(0, -1, 0, 1))
         for column in (2, 1) if self.has_target else (1,):
             path = QPainterPath()
@@ -122,7 +130,7 @@ class Trend(QWidget):
                     path.moveTo(p)
                     path.lineTo(p + QPointF(0.6, 0))
                 continue_line = True
-            pen = QPen(self.accent if column == 1 else QColor("#899db4"), 2 if column == 1 else 1.4)
+            pen = QPen(accent if column == 1 else muted, 2 if column == 1 else 1.4)
             if column == 2:
                 pen.setStyle(Qt.DashLine)
             painter.setPen(pen)
@@ -131,14 +139,17 @@ class Trend(QWidget):
         if self.cursor and plot.contains(self.cursor):
             t = start + (self.cursor.x() - plot.left()) / plot.width() * self.window
             index = min(len(points) - 1, bisect.bisect_left([row[0] for row in points], t))
-            t, value, _ = points[index]
+            t, value, target = points[index]
             if value is not None and math.isfinite(value):
                 p = location(t, value)
                 painter.setPen(QPen(muted, 1, Qt.DotLine))
                 painter.drawLine(QPointF(p.x(), plot.top()), QPointF(p.x(), plot.bottom()))
-                painter.setBrush(self.accent)
+                painter.setBrush(accent)
                 painter.setPen(Qt.NoPen)
                 painter.drawEllipse(p, 3, 3)
-                painter.setPen(QColor("#182a40"))
-                x = min(max(p.x() + 7, plot.left()), plot.right() - 125)
-                painter.drawText(QRectF(x, plot.top() + 2, 125, 20), Qt.AlignLeft, f"{t:.2f}s  ·  {value:.2f}")
+                painter.setPen(QColor(pal.text))
+                text = f"{t:.2f}s  ·  {value:.2f}"
+                if target is not None and math.isfinite(target):
+                    text += f"  ·  {self.target_name} {target:.2f}"
+                x = min(max(p.x() + 7, plot.left()), plot.right() - 230)
+                painter.drawText(QRectF(x, plot.top() + 2, 230, 20), Qt.AlignLeft, text)

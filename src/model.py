@@ -3,9 +3,9 @@ from enum import IntEnum
 import struct
 
 MAGIC = 0x4D425443
-PROTOCOL = 3
-COMMAND_WORDS = 28
-STATUS_WORDS = 27
+PROTOCOL = 4
+COMMAND_WORDS = 32
+STATUS_WORDS = 29
 MAX_DISCOVERY = 96
 SWD_RATES_KHZ = (100, 200, 400, 1000, 2000, 4000, 8000)
 READ_SWD_RATES_KHZ = (400, 1000, 2000, 4000, 8000)
@@ -25,6 +25,7 @@ class Op(IntEnum):
     WRITE = 8
     SAVE = 9
     NATIVE_ZERO = 10
+    TUNE = 11
 
 
 class State(IntEnum):
@@ -98,7 +99,7 @@ def real(value):
     return struct.unpack("<f", struct.pack("<I", value))[0]
 
 
-def command(op, port=1, brand=0, model=0, node=None, args=(), encoder=65536, limits=(), control=()):
+def command(op, port=1, brand=0, model=0, node=None, args=(), encoder=65536, limits=(), control=(), ramp=0.0):
     words = [0] * COMMAND_WORDS
     words[1:5] = [int(op), port, brand, model]
     if node is not None:
@@ -111,6 +112,7 @@ def command(op, port=1, brand=0, model=0, node=None, args=(), encoder=65536, lim
         words[19:24] = limits
     if control:
         words[24:28] = control
+    words[28] = bits(ramp)
     return words
 
 

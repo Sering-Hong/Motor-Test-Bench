@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$IsccPath = 'ISCC.exe',
     [switch]$SkipAppBuild
 )

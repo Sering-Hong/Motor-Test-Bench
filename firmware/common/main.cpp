@@ -64,6 +64,7 @@ struct Motion {
     float positionKi = 0;
     float positionKd = 0;
     bool native = false;
+    float ramp = 0; // 目标变化率，0 为不限
 };
 
 struct Feedback {
@@ -111,6 +112,8 @@ enum StartStage { EnableDrive, PreloadPosition, SetDmMode, VerifyDmMode, QueryLk
 StartStage startStage;
 float dmRanges[3];
 float output;
+float setpoint; // 斜坡后实际给定
+float speedReference; // 速度环给定
 bool selected, stopAwaitingAck, disabledAck, hostHasPulse, flashReady;
 bool lkZeroNeedsReload;
 
@@ -135,6 +138,10 @@ void PutLittle32(uint8_t* bytes, uint32_t value) {
 }
 
 bool InRange(float f, float lo, float hi) { return std::isfinite(f) && f >= lo && f <= hi; }
+
+float Approach(float from, float to, float step) {
+    return from < to ? std::min(from + step, to) : std::max(from - step, to);
+}
 
 void Finish(uint32_t seq, Result value) {
     ack = seq;
@@ -715,6 +722,33 @@ void Command(const uint32_t* words) {
         Finish(seq, Ok);
         return;
     }
+    if (op == Tune) {
+        // 运行中在线改软件 PID、限幅与斜坡；积分项与输出同单位，改 Ki 无跳变。
+        const float kp = F32(words[8]), ki = F32(words[9]), kd = F32(words[10]);
+        const float positionKp = F32(words[11]), positionKi = F32(words[12]), positionKd = F32(words[13]);
+        const float limit = F32(words[14]), speedLimit = F32(words[15]), ramp = F32(words[28]);
+        if (state != Running || motion.native || !InRange(kp, 0, 100) || !InRange(ki, 0, 100) ||
+            !InRange(kd, 0, 100) || !InRange(positionKp, 0, 30) || !InRange(positionKi, 0, 100) ||
+            !InRange(positionKd, 0, 100) || !InRange(limit, 0.001f, MaximumOutput()) ||
+            !InRange(speedLimit, 0.1f, 3000) || !InRange(ramp, 0, 1e6f) ||
+            (motion.mode == 1 && !InRange(motion.target, -speedLimit, speedLimit))) {
+            Finish(seq, Invalid);
+            return;
+        }
+        motion.kp = kp;
+        motion.ki = ki;
+        motion.speedKd = kd;
+        motion.positionKp = positionKp;
+        motion.positionKi = positionKi;
+        motion.positionKd = positionKd;
+        motion.limit = limit;
+        motion.speedLimit = speedLimit;
+        motion.ramp = ramp;
+        PID_UpdateParameters(&speedPid, kp, ki, kd, limit, limit, 0.005f);
+        PID_UpdateParameters(&positionPid, positionKp, positionKi, positionKd, speedLimit, speedLimit, 0.005f);
+        Finish(seq, Ok);
+        return;
+    }
     if ((state != Idle && state != Fault) || transaction.seq) { Finish(seq, Busy); return; }
     const Route candidate{words[2], words[3], words[4], words[5], words[6], words[7], words[18]};
     if (op == Scan) {
@@ -810,7 +844,7 @@ void Command(const uint32_t* words) {
     const Motion next{words[8], F32(words[9]), F32(words[10]), F32(words[11]), F32(words[12]),
                       F32(words[13]), F32(words[14]), F32(words[15]), words[16] != 0, motion.encoderRange,
                       F32(words[19]), words[20], F32(words[21]), F32(words[22]), words[23] != 0,
-                      F32(words[24]), F32(words[25]), F32(words[26]), words[27] != 0};
+                      F32(words[24]), F32(words[25]), F32(words[26]), words[27] != 0, F32(words[28])};
     if ((next.mode != 1 && next.mode != 2) || !InRange(next.speedLimit, 0.1f, 3000) ||
         !InRange(next.target, next.mode == 1 ? -next.speedLimit : -36000,
                 next.mode == 1 ? next.speedLimit : 36000) ||
@@ -818,7 +852,7 @@ void Command(const uint32_t* words) {
         (!next.native && !InRange(next.limit, 0.001f, MaximumOutput())) || !InRange(next.kp, 0, 100) ||
         !InRange(next.ki, 0, 100) || !InRange(next.positionKp, 0, 30) || !InRange(next.ratio, 0.01f, 1000) ||
         !InRange(next.speedKd, 0, 100) || !InRange(next.positionKi, 0, 100) || !InRange(next.positionKd, 0, 100) ||
-        !InRange(next.temperatureLimit, 20, 150) || next.feedbackTimeout < 25 || next.feedbackTimeout > 250 ||
+        !InRange(next.ramp, 0, 1e6f) || !InRange(next.temperatureLimit, 20, 150) || next.feedbackTimeout < 25 || next.feedbackTimeout > 250 ||
         !InRange(next.positionMin, -36000, 36000) || !InRange(next.positionMax, -36000, 36000) ||
         (next.positionLimited && next.positionMin >= next.positionMax)) {
         Finish(seq, Invalid);
@@ -843,9 +877,11 @@ void Command(const uint32_t* words) {
     PID_Init(&speedPid, motion.kp, motion.ki, motion.speedKd, motion.limit, motion.limit, 0.005f);
     PID_Init(&positionPid, motion.positionKp, motion.positionKi, motion.positionKd,
              motion.speedLimit, motion.speedLimit, 0.005f);
-    positionPid.LastError = motion.target - Position(motion);
-    speedPid.LastError = (motion.mode == 1 ? motion.target : 0.0f) -
-                         feedback.speed * (motion.reverse ? -1 : 1) / motion.ratio;
+    // 有斜坡时从当前测量值出发，避免使能瞬间给定突变。
+    const float measuredSpeed = feedback.speed * (motion.reverse ? -1 : 1) / motion.ratio;
+    setpoint = motion.ramp <= 0 ? motion.target
+             : (motion.mode == 1 ? clamp(measuredSpeed, -motion.speedLimit, motion.speedLimit) : Position(motion));
+    speedReference = 0;
     operateSeq = seq;
     startAt = lastSend = now;
     stageAt = now;
@@ -946,11 +982,12 @@ void ServiceRun() {
     }
     if (operateSeq) { Finish(operateSeq, Ok); operateSeq = 0; }
     const float sign = motion.reverse ? -1.0f : 1.0f;
+    setpoint = motion.ramp > 0 ? Approach(setpoint, motion.target, motion.ramp * 0.005f) : motion.target;
     if (!motion.native) {
-        const float desired = motion.mode == 1 ? motion.target : PID_Calc(&positionPid, motion.target, position);
-        output = clamp(PID_Calc(&speedPid, desired, feedback.speed * sign / motion.ratio), -motion.limit, motion.limit) * sign;
+        speedReference = motion.mode == 1 ? setpoint : PID_Calc(&positionPid, setpoint, position);
+        output = clamp(PID_Calc(&speedPid, speedReference, feedback.speed * sign / motion.ratio), -motion.limit, motion.limit) * sign;
     }
-    if (!Pending() && (motion.native ? SendNative(motion.target) : SendOutput(output))) txFailedAt = now;
+    if (!Pending() && (motion.native ? SendNative(setpoint) : SendOutput(output))) txFailedAt = now;
     else if (now - txFailedAt > 20) BeginStop(CanFailure, 0);
 }
 
@@ -984,6 +1021,8 @@ void Publish() {
     BenchStatus[24] = Bits(motion.target);
     BenchStatus[25] = route.port;
     BenchStatus[26] = route.family == Dm ? DriveTx(dmMode) : route.tx;
+    BenchStatus[27] = Bits(setpoint);
+    BenchStatus[28] = Bits(speedReference);
     __DMB();
     BenchStatus[0] = ++version;
 }

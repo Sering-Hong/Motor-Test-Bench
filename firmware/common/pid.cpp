@@ -75,6 +75,8 @@ void PID_UpdateParameters(PID_Controller_t *pid, float kp, float ki, float kd,
 }
 
 // 位置式 PID，带积分和输出限幅。
+// NOTE: 积分项直接累加 Ki·e·dt，限幅与输出同单位，在线改 Ki 不会跳变；
+// 微分作用在测量值上，目标阶跃时不产生微分冲击，首个周期微分为 0。
 float PID_Calc(PID_Controller_t *pid, float setpoint, float current_value)
 {
     float candidate_integral;
@@ -88,20 +90,24 @@ float PID_Calc(PID_Controller_t *pid, float setpoint, float current_value)
 
     pid->SetPoint = setpoint;
     pid->Error = setpoint - current_value;
-    derivative = (pid->Error - pid->LastError) / pid->ControlTime;
+    derivative = pid->Primed
+               ? -(current_value - pid->LastMeasurement) / pid->ControlTime
+               : 0.0f;
+    pid->LastMeasurement = current_value;
+    pid->Primed = 1;
 
     // 先计算候选积分值；输出已饱和且误差仍会加剧饱和时，不再积分。
-    candidate_integral = PID_Clamp(pid->Integral + pid->Error * pid->ControlTime,
+    candidate_integral = PID_Clamp(pid->Integral + pid->Ki * pid->Error * pid->ControlTime,
                                    pid->IntegralLimit);
     raw_output = pid->Kp * pid->Error
-               + pid->Ki * candidate_integral
+               + candidate_integral
                + pid->Kd * derivative;
 
     if (((raw_output > pid->OutputLimit) && (pid->Error > 0.0f)) ||
         ((raw_output < -pid->OutputLimit) && (pid->Error < 0.0f)))
     {
         raw_output = pid->Kp * pid->Error
-                   + pid->Ki * pid->Integral
+                   + pid->Integral
                    + pid->Kd * derivative;
     }
     else
@@ -155,6 +161,8 @@ void PID_Reset(PID_Controller_t *pid)
     pid->LastError = 0.0f;
     pid->PreviousError = 0.0f;
     pid->Integral = 0.0f;
+    pid->LastMeasurement = 0.0f;
+    pid->Primed = 0;
 }
 
 // 绑定现有状态与函数，供外部通过模块结构体访问。

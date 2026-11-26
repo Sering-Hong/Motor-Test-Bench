@@ -2,13 +2,13 @@
 #include <cstdint>
 
 namespace motor_test {
-constexpr uint32_t Protocol = 3;
+constexpr uint32_t Protocol = 4;
 constexpr uint32_t Magic = 0x4D425443;
-constexpr unsigned CommandWords = 28;
-constexpr unsigned StatusWords = 27;
+constexpr unsigned CommandWords = 32;
+constexpr unsigned StatusWords = 29;
 constexpr unsigned DiscoverySize = 96;
 
-enum Operation : uint32_t { Stop = 1, Scan, Select, Start, Target, Zero, ReadParam, WriteParam, SaveParams, NativeZero };
+enum Operation : uint32_t { Stop = 1, Scan, Select, Start, Target, Zero, ReadParam, WriteParam, SaveParams, NativeZero, Tune };
 enum State : uint32_t { Idle, Scanning, Starting, Running, Stopping, Fault };
 enum Result : uint32_t {
     Ok, Invalid, Offline, Busy, Timeout, ReadbackMismatch, WrongMode, CanFailure, HostLost, MotorFault, Conflict,

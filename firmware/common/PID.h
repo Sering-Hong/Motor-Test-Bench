@@ -9,14 +9,16 @@ typedef struct
     float Kp; // 比例系数
     float Ki; // 积分系数（单位：1/s）
     float Kd; // 微分系数（单位：s）
-    float IntegralLimit; // 积分累加值绝对限幅
+    float IntegralLimit; // 积分项绝对限幅，与输出同单位
     float OutputLimit; // 控制输出绝对限幅
     float Output; // 本次控制输出
     float SetPoint; // 目标值
     float Error; // 当前误差：目标值 - 测量值
     float LastError; // 上一次误差
     float PreviousError; // 上上次误差，供增量式 PID 使用
-    float Integral; // 误差积分值
+    float Integral; // 积分项 Ki·∫e dt，与输出同单位
+    float LastMeasurement; // 上次测量值，微分用
+    int Primed; // 0 表示尚无上次测量
     float ControlTime; // 固定控制周期，单位：s
     float ConfigKp; // 最近一次同步的配置值。
     float ConfigKi;

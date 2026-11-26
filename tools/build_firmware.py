@@ -12,9 +12,9 @@ FIRMWARE = ROOT / "firmware"
 BUNDLE = ROOT / "bundle"
 SYMBOLS = {
     "BenchIdentity": ("identity", 16),
-    "BenchCommand": ("command", 112),
+    "BenchCommand": ("command", 128),
     "BenchHeartbeat": ("heartbeat", 4),
-    "BenchStatus": ("status", 108),
+    "BenchStatus": ("status", 116),
     "BenchDiscovery": ("discovery", 96 * 20),
 }
 
@@ -53,7 +53,7 @@ def build(board: str, folder: str, number: int) -> None:
     shutil.copy2(elf, BUNDLE / f"{board}.elf")
     (BUNDLE / f"{board}.json").write_text(json.dumps({
         "board": number,
-        "abi": 3,
+        "abi": 4,
         "build": build_id,
         "sha256": hashlib.sha256(image.read_bytes()).hexdigest(),
         **addresses,

@@ -1,11 +1,11 @@
 {
   "board": 407,
-  "abi": 3,
-  "build": 716896783,
-  "sha256": "7a6c1291dfa80cfd39ce4785ab32d796d800f125af6d161dec71e8493c90b225",
-  "command": 536873520,
-  "discovery": 536871488,
-  "heartbeat": 536873516,
-  "identity": 134242400,
-  "status": 536873408
+  "abi": 4,
+  "build": 333802436,
+  "sha256": "58ac0d83ed0cb77c6d3d014e563d962ad814d5b46c910fd8314e938150ea481f",
+  "command": 536873560,
+  "discovery": 536871520,
+  "heartbeat": 536873556,
+  "identity": 134243560,
+  "status": 536873440
 }

@@ -2,30 +2,39 @@ from __future__ import annotations
 
 from collections import deque
 import csv
+import logging
 from pathlib import Path
 import re
 import sys
 
-from PyQt5.QtCore import QSettings, Qt, QTimer
-from PyQt5.QtGui import QIcon
+from PyQt5.QtCore import QSettings, Qt, QTimer, QUrl
+from PyQt5.QtGui import QDesktopServices, QIcon, QKeySequence
 from PyQt5.QtWidgets import (
     QAbstractSpinBox, QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
     QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
-    QMessageBox, QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox, QStackedWidget,
-    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QMessageBox, QProgressBar, QPushButton, QScrollArea, QShortcut, QSizePolicy, QSlider, QSpinBox, QStackedWidget,
+    QTableWidget, QTableWidgetItem, QTextBrowser, QVBoxLayout, QWidget,
 )
 
+from analysis import advice, format_metrics, step_metrics
+from appearance import AppearanceDialog
+import applog
 from model import (
     BOARDS, BRANDS, DEFAULT_SAMPLE_HZ, DEFAULT_SWD_KHZ, DM_PARAMS, LK_PARAMS, LK_PID_NAMES,
     MODELS, READ_SWD_RATES_KHZ, RESULT, SAMPLE_RATES_HZ, STATE, SWD_RATES_KHZ, Node, Op, State, bits, command, real,
 )
 from probe import ROOT, ProbeWorker
+import theme
 from trend import Trend
 
 
+log = logging.getLogger("motorbench.ui")
 ZOOMS = (100, 125, 150, 175, 200)
-STYLESHEET = (ROOT / "src" / "style.qss").read_text(encoding="utf-8-sig")
+TEMPLATE = (ROOT / "src" / "style.qss").read_text(encoding="utf-8-sig")
 ICON = ROOT / "src" / "motorbench.ico"
+MANUAL = ROOT / "使用说明.md"
+GUIDE_STEPS = ("连接探针", "测试固件", "扫描电机", "选中电机", "运行测试")
+NUMBERS = "①②③④⑤"
 
 
 def label(value, kind=""):
@@ -161,6 +170,11 @@ class BenchWindow(QMainWindow):
         self.samples = deque(maxlen=6000)
         self.last_seq = self.start_tick = None
         self.curve_paused = False
+        self.last_status = None
+        self.step_test = None
+        self.guide_callback = None
+        self.appearance = theme.Appearance.load(self.preferences)
+        self.appearance_dialog = None
         self.setWindowTitle("电机测试台")
         self.brand_icon = QIcon(str(ICON))
         self.setWindowIcon(self.brand_icon)
@@ -168,20 +182,34 @@ class BenchWindow(QMainWindow):
         self.setMinimumSize(720, 580)
         self.build()
         self.bind()
-        saved_zoom = self.preferences.value("ui/zoom", 200, type=int)
-        self.zoom.setCurrentIndex(ZOOMS.index(saved_zoom) if saved_zoom in ZOOMS else ZOOMS.index(200))
+        self.apply_appearance()
+        default_zoom = self.default_zoom()
+        saved_zoom = self.preferences.value("ui/zoom", default_zoom, type=int)
+        self.zoom.setCurrentIndex(ZOOMS.index(saved_zoom if saved_zoom in ZOOMS else default_zoom))
         self.set_zoom(self.zoom.currentIndex())
+        board = self.preferences.value("ui/board", 0, type=int)
+        self.board.setCurrentIndex(board if 0 <= board < len(BOARDS) else 0)
         self.change_board()
-        self.change_brand(0)
+        brand = self.preferences.value("ui/brand", 0, type=int)
+        brand = brand if 0 <= brand < len(BRANDS) else 0
+        self.brand_tabs.button(brand).setChecked(True)
+        self.change_brand(brand)
+        self.window_range.setCurrentIndex(min(2, max(0, self.preferences.value("ui/chartRange", 0, type=int))))
+        geometry = self.preferences.value("ui/geometry")
+        if geometry is not None:
+            self.restoreGeometry(geometry)
+        QShortcut(QKeySequence(Qt.Key_Escape), self, activated=self.escape_stop)
         self.timer = QTimer(self)
         self.timer.timeout.connect(worker.pulse)
         self.timer.start(50)
         worker.pulse()
 
     def build(self):
-        surface, shell = box("surface", QVBoxLayout, 0)
+        self.background = theme.BackgroundWidget()
+        self.setCentralWidget(self.background)
+        shell = QVBoxLayout(self.background)
+        shell.setContentsMargins(0, 0, 0, 0)
         shell.setSpacing(0)
-        self.setCentralWidget(surface)
         header, top = box("header", QHBoxLayout, 17)
         self.header_icon = QLabel()
         top.addWidget(self.header_icon)
@@ -190,12 +218,19 @@ class BenchWindow(QMainWindow):
         top.addWidget(self.subtitle)
         top.addStretch()
         self.connection = label("未连接", "connection")
-        self.stop = button("停止输出", "stop")
+        self.stop = button("停止输出 (Esc)", "stop")
+        self.stop.setToolTip("立即停止电机输出（快捷键 Esc）")
+        self.appearance_button = button("外观", "headerTool")
+        self.appearance_button.setToolTip("背景图、透明度、浅色 / 深色")
+        self.help_button = button("帮助", "headerTool")
+        self.help_button.setToolTip("使用说明与日志目录")
         self.zoom = combo([f"{value}%" for value in ZOOMS])
         self.zoom.setToolTip("界面缩放")
         self.zoom.setAccessibleName("界面缩放")
         top.addWidget(self.connection)
         top.addWidget(self.zoom)
+        top.addWidget(self.appearance_button)
+        top.addWidget(self.help_button)
         top.addWidget(self.stop)
         shell.addWidget(header)
 
@@ -204,6 +239,7 @@ class BenchWindow(QMainWindow):
         workspace_scroll.setWidgetResizable(True)
         workspace_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         workspace_scroll.setWidget(body)
+        workspace_scroll.viewport().setAutoFillBackground(False)
         shell.addWidget(workspace_scroll, 1)
         toolbar, self.toolbar_layout = box("toolbar", QGridLayout, 10)
         toolbar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
@@ -220,6 +256,21 @@ class BenchWindow(QMainWindow):
         fields.addWidget(self.probe, 1)
         self.link_actions = pair(self.refresh, self.connect_button, self.flash_button, self.import_button)
         layout.addWidget(toolbar)
+        self.guide, guide = box("guide", QHBoxLayout, 10)
+        self.guide_steps = []
+        for index, name in enumerate(GUIDE_STEPS):
+            if index:
+                guide.addWidget(label("›", "muted"))
+            step = label(f"{NUMBERS[index]} {name}", "guideStep")
+            self.guide_steps.append(step)
+            guide.addWidget(step)
+        guide.addSpacing(10)
+        self.guide_hint = label("", "guideHint")
+        self.guide_hint.setWordWrap(True)
+        guide.addWidget(self.guide_hint, 1)
+        self.guide_action = button("", "guideAction")
+        guide.addWidget(self.guide_action)
+        layout.addWidget(self.guide)
         self.progress = QProgressBar()
         self.progress.setTextVisible(False)
         self.progress.hide()
@@ -242,7 +293,7 @@ class BenchWindow(QMainWindow):
         for panel in self.panels:
             columns.addWidget(panel, 1)
         layout.addLayout(columns, 1)
-        self.notice = label("连接 J-Link 或 CMSIS-DAP 开始。", "muted")
+        self.notice = label("插上 J-Link 或 CMSIS-DAP（DAPLink），跟着上方引导条操作。", "muted")
         self.notice.setWordWrap(True)
         layout.addWidget(self.notice)
 
@@ -252,8 +303,7 @@ class BenchWindow(QMainWindow):
         percent = ZOOMS[index]
         self.preferences.setValue("ui/zoom", percent)
         self.scale = percent / 100
-        style = re.sub(r"(\d+(?:\.\d+)?)px", lambda m: f"{round(float(m[1]) * self.scale)}px", STYLESHEET)
-        QApplication.instance().setStyleSheet(style)
+        self.apply_style()
         icon_size = round(34 * self.scale)
         self.header_icon.setPixmap(self.brand_icon.pixmap(icon_size, icon_size))
         for chart in self.charts:
@@ -337,12 +387,13 @@ class BenchWindow(QMainWindow):
         layout.addWidget(self.device)
         layout.addWidget(self.route)
         layout.addWidget(self.state_label, 0, Qt.AlignLeft)
-        subnav, self.detail_tabs = tabs(("测试控制", "保护与零点", "电机参数"))
+        subnav, self.detail_tabs = tabs(("测试控制", "保护零点", "电机参数", "阶跃整定"))
         layout.addWidget(subnav)
         self.detail = QStackedWidget()
         self.detail.addWidget(self.motion_panel())
         self.detail.addWidget(self.settings_panel())
         self.detail.addWidget(self.parameter_panel())
+        self.detail.addWidget(self.step_panel())
         layout.addWidget(self.detail, 1)
         return card
 
@@ -356,6 +407,9 @@ class BenchWindow(QMainWindow):
         self.speed_limit = number(0.1, 3000, 100)
         self.ratio = number(0.01, 1000, 1, 3)
         self.reverse = QCheckBox("反向")
+        self.ramp = number(0, 1000000, 0, 1)
+        self.ramp.setToolTip("目标变化的最大速率，0 表示不限。阶跃整定时请设为 0")
+        self.ramp_label = label("目标斜坡 [rpm/s]")
         self.kp = number(0, 100, 1, 4)
         self.ki = number(0, 100, 1, 4)
         self.kd = number(0, 100, 0, 4)
@@ -367,10 +421,19 @@ class BenchWindow(QMainWindow):
         self.target_label = label("目标转速 [rpm]")
         self.limit_label = label("输出上限 [码]")
         for title, widget in ((self.strategy_label, self.strategy), ("目标类型", self.mode), (self.target_label, self.target),
-                              ("速度上限 [rpm]", self.speed_limit), (self.limit_label, self.limit),
-                              ("减速比", pair(self.ratio, self.reverse))):
+                              (self.ramp_label, self.ramp), ("速度上限 [rpm]", self.speed_limit),
+                              (self.limit_label, self.limit), ("减速比", pair(self.ratio, self.reverse))):
             form.addRow(title, widget)
         layout.addLayout(form)
+        self.metrics_box, readouts = box("metrics", QGridLayout, 8)
+        self.readouts = {}
+        for column, (key, name) in enumerate((("speed", "转速 rpm"), ("pos", "位置 °"),
+                                              ("effort", "电流 码"), ("temp", "温度 °C"))):
+            value, title = label("—", "bigValue"), label(name, "bigName")
+            readouts.addWidget(value, 0, column, Qt.AlignCenter)
+            readouts.addWidget(title, 1, column, Qt.AlignCenter)
+            self.readouts[key] = (value, title)
+        layout.addWidget(self.metrics_box)
         self.tuning = button("展开 PID 参数")
         self.tuning.setCheckable(True)
         layout.addWidget(self.tuning)
@@ -386,6 +449,10 @@ class BenchWindow(QMainWindow):
                 editor.setButtonSymbols(QAbstractSpinBox.NoButtons)
                 editor.setAccessibleName(f"{name} {('Kp', 'Ki', 'Kd')[column - 1]}")
                 tuning.addWidget(editor, row, column)
+        self.apply_tune_button = button("在线应用参数")
+        self.apply_tune_button.setToolTip("运行中把 PID、限幅、速度上限和斜坡直接写入测试板，不用停机")
+        self.reset_tune = button("恢复默认参数")
+        tuning.addWidget(pair(self.apply_tune_button, self.reset_tune), 3, 0, 1, 4)
         self.tune_panel.hide()
         layout.addWidget(self.tune_panel)
         self.native_note = label("", "inlineNote")
@@ -419,6 +486,38 @@ class BenchWindow(QMainWindow):
         for widget in (self.param_tip, self.param_combo, self.param_read, self.param_value, self.edit_area,
                        self.param_write, self.param_save):
             layout.addWidget(widget)
+        layout.addStretch()
+        return scroll
+
+    def step_panel(self):
+        scroll, layout = scroll_panel()
+        intro = label("电机运行中自动把目标抬高一个幅值、保持、再回到原值，"
+                      "测上升时间、超调、调节时间和稳态误差，并给出调参方向。"
+                      "速度模式测转速，相对位置模式测位置。", "muted")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        self.step_amplitude = number(-36000, 36000, 100, 2)
+        self.step_amplitude_label = label("阶跃幅值 [rpm]")
+        self.step_hold = number(0.3, 10, 1.5, 1)
+        form = QFormLayout()
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        form.addRow(self.step_amplitude_label, self.step_amplitude)
+        form.addRow("保持时间 [s]", self.step_hold)
+        layout.addLayout(form)
+        self.step_start = button("开始阶跃测试", "primary")
+        layout.addWidget(self.step_start)
+        self.step_result = label("先在「测试控制」里使能运行，再回到这里。", "metric")
+        self.step_result.setWordWrap(True)
+        layout.addWidget(self.step_result)
+        self.step_advice = label("", "inlineNote")
+        self.step_advice.setWordWrap(True)
+        self.step_advice.hide()
+        layout.addWidget(self.step_advice)
+        note = label("先用小幅值；测试中按 Esc 或「停止输出」立即中止。"
+                     "上位机读取频率越高指标越准（频率设置里可调到 200 Hz）。"
+                     "位置模式是串级控制：先在速度模式把速度环调好，再调位置环。", "muted")
+        note.setWordWrap(True)
+        layout.addWidget(note)
         layout.addStretch()
         return scroll
 
@@ -469,13 +568,16 @@ class BenchWindow(QMainWindow):
         for control in (self.window_range, self.pause, self.export):
             bar.addWidget(control)
         layout.addLayout(bar)
-        self.speed_chart = Trend("转速", "rpm", "#1472cb", True)
-        self.position_chart = Trend("相对位置", "°", "#6850b5", True)
-        self.effort_chart = Trend("反馈电流原始码", "码", "#087b72")
+        self.speed_chart = Trend("转速", "rpm", 0, True, "给定")
+        self.position_chart = Trend("相对位置", "°", 1, True, "给定")
+        self.effort_chart = Trend("反馈电流原始码", "码", 2, True, "指令")
         self.charts = (self.speed_chart, self.position_chart, self.effort_chart)
         for chart in self.charts:
             layout.addWidget(chart, 1)
-        layout.addWidget(label("实线 · 反馈       虚线 · 目标", "muted"))
+        legend = label("实线 · 反馈    虚线 · 给定（斜坡后的实际给定；位置模式下转速虚线是位置环输出的速度给定）"
+                       "    电流虚线 · 软件 PID 指令输出", "muted")
+        legend.setWordWrap(True)
+        layout.addWidget(legend)
         return widget
 
     def bind(self):
@@ -522,6 +624,13 @@ class BenchWindow(QMainWindow):
         self.window_range.currentIndexChanged.connect(self.set_chart_range)
         self.pause.toggled.connect(self.toggle_pause)
         self.export.clicked.connect(self.export_csv)
+        self.appearance_button.clicked.connect(self.open_appearance)
+        self.help_button.clicked.connect(self.open_help)
+        self.guide_action.clicked.connect(self.run_guide)
+        self.table.itemDoubleClicked.connect(lambda *_: self.select_button.isEnabled() and self.select_row())
+        self.apply_tune_button.clicked.connect(self.apply_tune)
+        self.reset_tune.clicked.connect(self.reset_profile)
+        self.step_start.clicked.connect(self.start_step_test)
 
     def change_board(self, *_):
         board = BOARDS[self.board.currentIndex()]
@@ -566,21 +675,54 @@ class BenchWindow(QMainWindow):
             return
         self.model_index = index
         self.limit.setMaximum((16384, 10000, 30000)[index] if self.brand == 0 else (20 if self.brand == 1 else 2048))
-        self.limit.setValue((250, 0.5, 100)[self.brand])
-        self.kp.setValue(0.025 if self.brand == 1 else 1)
-        self.ki.setValue(0.02 if self.brand == 1 else 1)
-        self.kd.setValue(0)
-        self.position_kp.setValue(0.5)
-        self.position_ki.setValue(0)
-        self.position_kd.setValue(0)
+        self.load_profile()
         self.limit_label.setText("转矩上限 [N·m]" if self.brand == 1 else "输出上限 [码]")
         self.effort_chart.title = "反馈转矩" if self.brand == 1 else "反馈电流原始码"
         self.effort_chart.unit = "N·m" if self.brand == 1 else "码"
+        self.readouts["effort"][1].setText("转矩 N·m" if self.brand == 1 else "电流 码")
         self.scan_lo.setMaximum(2046 if self.brand == 1 else 32)
         self.scan_hi.setMaximum(2046 if self.brand == 1 else 32)
         self.scan_hi.setValue(32)
         self.load_protection()
         self.reset_view()
+
+    def tune_fields(self):
+        return (("mode", self.mode), ("strategy", self.strategy), ("speedLimit", self.speed_limit),
+                ("limit", self.limit), ("ratio", self.ratio), ("reverse", self.reverse), ("ramp", self.ramp),
+                ("kp", self.kp), ("ki", self.ki), ("kd", self.kd), ("positionKp", self.position_kp),
+                ("positionKi", self.position_ki), ("positionKd", self.position_kd))
+
+    def tune_defaults(self):
+        dm = self.brand == 1
+        return dict(mode=0, strategy=0, speedLimit=100.0, limit=(250.0, 0.5, 100.0)[self.brand], ratio=1.0,
+                    reverse=False, ramp=0.0, kp=0.025 if dm else 1.0, ki=0.02 if dm else 1.0, kd=0.0,
+                    positionKp=0.5, positionKi=0.0, positionKd=0.0)
+
+    def load_profile(self, defaults=False):
+        """按品牌/型号恢复上次使用的控制参数；没有记录或 defaults=True 时用默认值。"""
+        key = f"profiles/{self.brand}/{self.model_index}/tune"
+        for name, widget in self.tune_fields():
+            default = self.tune_defaults()[name]
+            value = default if defaults else self.preferences.value(f"{key}/{name}", default, type=type(default))
+            if isinstance(widget, QComboBox):
+                widget.setCurrentIndex(value if 0 <= value < widget.count() and (name != "strategy" or self.brand) else 0)
+            elif isinstance(widget, QCheckBox):
+                widget.setChecked(value)
+            else:
+                widget.setValue(value)
+
+    def save_profile(self):
+        key = f"profiles/{self.brand}/{self.model_index}/tune"
+        for name, widget in self.tune_fields():
+            value = (widget.currentIndex() if isinstance(widget, QComboBox) else
+                     widget.isChecked() if isinstance(widget, QCheckBox) else widget.value())
+            self.preferences.setValue(f"{key}/{name}", value)
+
+    def reset_profile(self):
+        self.load_profile(defaults=True)
+        self.save_profile()
+        running = self.state == State.RUNNING
+        self.notify("已恢复默认参数。" + ("运行中需点「在线应用参数」才生效。" if running else ""))
 
     def protection_key(self):
         return f"profiles/{self.brand}/{self.model_index}"
@@ -666,9 +808,21 @@ class BenchWindow(QMainWindow):
         node = self.selected_row()
         self.select_button.setEnabled(free and node is not None and not node.conflict)
         self.manual.setEnabled(free)
-        for widget in (self.mode, self.strategy, self.limit, self.speed_limit, self.ratio, self.reverse,
-                       self.kp, self.ki, self.kd, self.position_kp, self.position_ki, self.position_kd):
-            widget.setEnabled(not moving and self.pending is None)
+        editable = not moving and self.pending is None
+        live = (ready and self.state == State.RUNNING and self.strategy.currentIndex() == 0 and
+                self.pending is None and self.step_test is None)
+        for widget in (self.mode, self.strategy, self.ratio, self.reverse):
+            widget.setEnabled(editable)
+        for widget in (self.limit, self.speed_limit, self.ramp, self.kp, self.ki, self.kd,
+                       self.position_kp, self.position_ki, self.position_kd):
+            widget.setEnabled(editable or live)
+        self.apply_tune_button.setEnabled(live)
+        self.reset_tune.setEnabled(editable or live)
+        self.step_start.setEnabled(ready and self.state == State.RUNNING and self.pending is None and
+                                   self.step_test is None)
+        self.step_start.setText("测试中…" if self.step_test else "开始阶跃测试")
+        for widget in (self.step_amplitude, self.step_hold):
+            widget.setEnabled(self.step_test is None)
         selected = free and self.active is not None and self.online
         self.enable.setEnabled(selected and not self.fault and not self.needs_reload and (self.brand != 1 or self.dm_ready))
         self.zero.setEnabled(selected)
@@ -678,7 +832,8 @@ class BenchWindow(QMainWindow):
             widget.setEnabled(not moving and self.pending is None)
         for widget in (self.angle_min, self.angle_max):
             widget.setEnabled(self.angle_enabled.isChecked() and not moving and self.pending is None)
-        self.update_target.setEnabled(ready and self.state == State.RUNNING and self.pending is None)
+        self.update_target.setEnabled(ready and self.state == State.RUNNING and self.pending is None and
+                                      self.step_test is None)
         can_param = selected and self.parameter is not None
         current = can_param and self.param_readback is not None
         lk_offset = self.brand == 2 and self.parameter is not None and self.parameter.addr == 0x90
@@ -690,8 +845,10 @@ class BenchWindow(QMainWindow):
         self.param_write.setToolTip("领控零偏写入需要已选中 14 位编码器配置。" if lk_offset else "")
         self.param_save.setEnabled(can_param and (self.brand == 1 or (self.parameter.addr == 0x30 and current)))
         self.export.setEnabled(bool(self.samples))
+        self.update_guide()
 
     def notify(self, message, error=False):
+        (log.warning if error else log.info)(message)
         self.notice.setText(message)
         self.notice.setObjectName("alert" if error else "muted")
         self.notice.style().unpolish(self.notice)
@@ -789,10 +946,12 @@ class BenchWindow(QMainWindow):
         self.refresh_enabled()
         self.worker.send("flash", path, self.flash_swd_khz)
 
-    def issue(self, op, args=(), node=None, port=1, limits=(), control=()):
+    def issue(self, op, args=(), node=None, port=1, limits=(), control=(), ramp=0.0):
         self.pending = op
         encoder = (65536, 16384, 32768)[self.encoder.currentIndex()]
-        self.worker.send("command", command(op, port, self.brand, self.model_index, node, args, encoder, limits, control))
+        log.info("命令 %s args=%s", Op(op).name, args)
+        self.worker.send("command", command(op, port, self.brand, self.model_index, node, args, encoder, limits,
+                                            control, ramp))
         self.refresh_enabled()
 
     def start_scan(self):
@@ -808,6 +967,13 @@ class BenchWindow(QMainWindow):
         if not self.next_ports:
             self.port_scan = None
             self.scan_status.setText(f"扫描结束，发现 {len(self.nodes)} 台")
+            usable = [node for node in self.nodes.values() if not node.conflict]
+            if len(self.nodes) == 1 and usable and self.active is None and self.pending is None:
+                for row in range(self.table.rowCount()):
+                    if self.table.item(row, 0).data(Qt.UserRole) == usable[0]:
+                        self.table.selectRow(row)
+                self.scan_status.setText("扫描结束，只发现 1 台，已自动选中")
+                self.select_node(usable[0])
             return
         self.port_scan = self.next_ports.popleft()
         self.scan_status.setText(f"正在扫描 CAN{self.port_scan}…")
@@ -891,11 +1057,19 @@ class BenchWindow(QMainWindow):
     def stop_output(self):
         self.next_ports.clear()
         self.port_scan = None
+        if self.step_test:
+            self.finish_step("已中止：手动停止输出。")
         self.issue(Op.STOP)
+
+    def escape_stop(self):
+        if self.ready and not self.flashing:
+            self.stop_output()
 
     def change_mode(self, *_):
         speed_mode = self.mode.currentIndex() == 0
         self.target_label.setText("目标转速 [rpm]" if speed_mode else "相对位置 [°]")
+        self.ramp_label.setText("目标斜坡 [rpm/s]" if speed_mode else "目标斜坡 [°/s]")
+        self.step_amplitude_label.setText("阶跃幅值 [rpm]" if speed_mode else "阶跃幅值 [°]")
         limit = self.speed_limit.value() if speed_mode else 36000
         self.target.setRange(-limit, limit)
 
@@ -917,12 +1091,20 @@ class BenchWindow(QMainWindow):
         if angle_enabled and low >= high:
             self.notify("最小角度必须小于最大角度。", True)
             return
+        self.save_profile()
         self.issue(Op.START, (
             self.mode.currentIndex() + 1, bits(self.target.value()), bits(self.limit.value()), bits(self.speed_limit.value()),
             bits(self.kp.value()), bits(self.ki.value()), bits(self.position_kp.value()), bits(self.ratio.value()),
             int(self.reverse.isChecked()),
         ), limits=(bits(self.temperature.value()), self.feedback_timeout.value(), bits(low), bits(high), int(angle_enabled)),
-            control=(bits(self.kd.value()), bits(self.position_ki.value()), bits(self.position_kd.value()), self.strategy.currentIndex()))
+            control=(bits(self.kd.value()), bits(self.position_ki.value()), bits(self.position_kd.value()), self.strategy.currentIndex()),
+            ramp=self.ramp.value())
+
+    def apply_tune(self):
+        self.save_profile()
+        self.issue(Op.TUNE, tuple(bits(widget.value()) for widget in (
+            self.kp, self.ki, self.kd, self.position_kp, self.position_ki, self.position_kd,
+            self.limit, self.speed_limit)), ramp=self.ramp.value())
 
     def set_position_reference(self, position):
         self.issue(Op.ZERO, (bits(position), bits(self.ratio.value()), int(self.reverse.isChecked())))
@@ -1016,6 +1198,8 @@ class BenchWindow(QMainWindow):
             return
         self.pending = None
         if result:
+            if op == Op.TARGET and self.step_test:
+                self.finish_step(f"已中止：{RESULT[result] if result < len(RESULT) else result}")
             if op == Op.SCAN:
                 port = self.port_scan
                 self.scan_next()
@@ -1046,10 +1230,15 @@ class BenchWindow(QMainWindow):
             self.render_param(values)
         elif op in (Op.ZERO, Op.NATIVE_ZERO):
             self.clear_charts()
+        elif op == Op.TARGET and self.step_test:
+            self.step_test["marks"].append(self.samples[-1][0] if self.samples else 0.0)
+            QTimer.singleShot(round(self.step_test["hold"] * 1000), self.step_next)
+            self.refresh_enabled()
+            return
         messages = {
             Op.STOP: "输出已停止。", Op.SELECT: "路由已选定，等待反馈。", Op.START: "已进入测试运行。",
             Op.TARGET: "目标已更新。", Op.ZERO: "软件位置基准已更新。", Op.READ: "已读取电机参数。",
-            Op.WRITE: "已写入并读回校验。", Op.SAVE: "电机已应答保存指令。",
+            Op.WRITE: "已写入并读回校验。", Op.SAVE: "电机已应答保存指令。", Op.TUNE: "参数已在线生效，并已记住。",
             Op.NATIVE_ZERO: (f"驱动器已应答，零偏 {values[0]}。请重上电并重新选中电机。" if self.brand == 2 and values
                              else "已读取达妙驱动器置零后的反馈。"),
         }
@@ -1058,7 +1247,10 @@ class BenchWindow(QMainWindow):
         self.refresh_enabled()
 
     def status(self, data):
+        self.last_status = data
         self.state = State(data[2])
+        if self.step_test and self.state != State.RUNNING:
+            self.finish_step(f"已中止：电机已停止（{STATE[self.state]}）。")
         fault_text = f"已停止 · {RESULT[data[4]]}" if self.state == State.FAULT and 0 < data[4] < len(RESULT) else STATE[self.state]
         self.update_state_badge(fault_text)
         self.online = bool(data[21] & 128)
@@ -1084,6 +1276,7 @@ class BenchWindow(QMainWindow):
             if self.needs_reload:
                 detail += "\n已发出零点写入，请确认结果，重上电后重新选中。"
             self.feedback.setText(detail)
+            self.show_readouts(data)
             self.capture(data)
         self.refresh_enabled()
 
@@ -1106,24 +1299,28 @@ class BenchWindow(QMainWindow):
             self.state_label.style().polish(self.state_label)
 
     def capture(self, data):
-        if self.curve_paused or (self.online and self.last_seq == data[5]) or (not self.online and not self.was_online):
+        if (self.curve_paused and not self.step_test) or (self.online and self.last_seq == data[5]) or (not self.online and not self.was_online):
             return
         if self.start_tick is None:
             self.start_tick = data[1]
         t = ((data[1] - self.start_tick) & 0xffffffff) / 1000
         if self.online:
             running = self.state == State.RUNNING
+            software = self.strategy.currentIndex() == 0
+            speed_mode = self.mode.currentIndex() == 0
             speed, pos, effort = (real(data[i]) for i in (7, 8, 9))
-            speed_target = real(data[24]) if running and self.mode.currentIndex() == 0 else None
-            pos_target = real(data[24]) if running and self.mode.currentIndex() == 1 else None
+            setpoint, speed_reference = real(data[27]), real(data[28])
+            speed_target = (setpoint if speed_mode else speed_reference if software else None) if running else None
+            pos_target = setpoint if running and not speed_mode else None
+            output = real(data[11]) if running and software else None
             self.last_seq = data[5]
         else:
-            speed = pos = effort = speed_target = pos_target = None
+            speed = pos = effort = speed_target = pos_target = output = None
         self.was_online = self.online
-        self.samples.append((t, speed, pos, effort, speed_target, pos_target))
+        self.samples.append((t, speed, pos, effort, speed_target, pos_target, output))
         self.speed_chart.add(t, speed, speed_target)
         self.position_chart.add(t, pos, pos_target)
-        self.effort_chart.add(t, effort)
+        self.effort_chart.add(t, effort, output)
 
     def set_chart_range(self, index):
         for chart in self.charts:
@@ -1145,22 +1342,233 @@ class BenchWindow(QMainWindow):
         try:
             with open(path, "w", encoding="utf-8-sig", newline="") as file:
                 output = csv.writer(file)
-                output.writerow(("时间_s", "转速_rpm", "相对位置_deg", self.effort_chart.title, "目标转速_rpm", "目标位置_deg"))
+                output.writerow(("时间_s", "转速_rpm", "相对位置_deg", f"{self.effort_chart.title}_{self.effort_chart.unit}",
+                                 "转速给定_rpm", "位置给定_deg", f"指令输出_{self.effort_chart.unit}"))
                 output.writerows(self.samples)
             self.notify(f"已导出 {len(self.samples)} 条记录。")
         except OSError as error:
             self.notify(str(error), True)
+
+    # ---------------- 外观与帮助 ----------------
+    @staticmethod
+    def default_zoom():
+        screen = QApplication.primaryScreen()
+        want = (screen.logicalDotsPerInch() if screen else 96) / 96 * 100
+        return min(ZOOMS, key=lambda zoom: abs(zoom - want))
+
+    def apply_style(self):
+        style = theme.current().stylesheet(TEMPLATE)
+        style = re.sub(r"(\d+(?:\.\d+)?)px", lambda m: f"{round(float(m[1]) * self.scale)}px", style)
+        QApplication.instance().setStyleSheet(style)
+
+    def apply_appearance(self, appearance=None):
+        if appearance is not None:
+            self.appearance = appearance
+        variant = self.appearance.variant()
+        has_image = self.background.set_image(self.appearance.bg_path if variant.bg_enabled else "")
+        if self.appearance_dialog is not None:
+            self.appearance_dialog.set_image_error(self.background.error)
+        look = theme.build_theme(self.appearance, has_image)
+        self.background.set_look(look.pal.window, variant.bg_opacity / 100, look.pal.overlay, variant.overlay / 100)
+        theme.set_current(look)
+        self.apply_style()
+
+    def open_appearance(self):
+        if self.appearance_dialog is None:
+            self.appearance_dialog = AppearanceDialog(self.appearance, self)
+            self.appearance_dialog.changed.connect(self.apply_appearance)
+            self.appearance_dialog.finished.connect(self.close_appearance)
+        self.appearance_dialog.show()
+        self.appearance_dialog.raise_()
+
+    def close_appearance(self, _):
+        self.appearance.save(self.preferences)
+        self.appearance_dialog.deleteLater()
+        self.appearance_dialog = None
+
+    def open_help(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("使用说明")
+        dialog.resize(round(820 * self.scale), round(720 * self.scale))
+        view = QTextBrowser()
+        view.setOpenExternalLinks(True)
+        view.setMarkdown(MANUAL.read_text(encoding="utf-8") if MANUAL.is_file() else "未找到 使用说明.md")
+        logs, close = button("打开日志目录"), button("关闭", "primary")
+        logs.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(applog.log_dir()))))
+        close.clicked.connect(dialog.accept)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(view, 1)
+        layout.addWidget(pair(logs, close))
+        dialog.exec()
+
+    # ---------------- 引导条 ----------------
+    def guide_state(self):
+        """返回 (当前步骤, 提示, 按钮文字, 回调)；按钮文字为空表示这一步只需等待。"""
+        if self.flashing:
+            return 1, "正在烧录并逐字节校验，请勿断开探针和板子电源。", "", None
+        if self.connecting:
+            return 0, "正在连接测试板…", "", None
+        if not self.connected:
+            if self.probe.currentData() is None:
+                return 0, "插上 J-Link / DAPLink，SWD 线接测试板（SWDIO、SWCLK、GND），板子上电后点刷新。", \
+                    "刷新探针", lambda: self.worker.send("list")
+            return 0, f"确认测试板型号是「{self.board.currentText()}」，然后连接。", "连接", self.connect_probe
+        if not self.ready:
+            return 1, "板上不是匹配的测试固件。烧录一次即可（会覆盖板上原有程序）。", "烧录测试固件", lambda: self.flash(None)
+        if self.port_scan is not None:
+            return 2, f"正在扫描 CAN{self.port_scan}…", "", None
+        if self.active is None:
+            if self.pending == Op.SELECT:
+                return 3, "正在选中电机…", "", None
+            node = self.selected_row()
+            if node is None or node.conflict:
+                node = next((n for n in self.nodes.values() if not n.conflict), None)
+            if node is None:
+                return 2, "选上方品牌和左侧型号，接好电机电源与 CAN 线，再扫描。", "扫描电机", self.start_scan
+            return 3, "在左侧列表里选中要测试的电机（双击也可以）。", f"选中 CAN{node.port} #{node.id}", \
+                lambda: self.select_node(node)
+        if self.state == State.RUNNING:
+            return 4, "运行中：改目标点「发送新目标」；PID 改完点「在线应用参数」；「阶跃整定」可自动评估。Esc 立即停止。", \
+                "停止输出", self.stop_output
+        if self.state in (State.STARTING, State.STOPPING):
+            return 4, STATE[self.state] + "…", "", None
+        if not self.online:
+            return 3, "等待电机反馈：检查电机供电、CAN 线和终端电阻。", "", None
+        if self.brand == 1 and not self.dm_ready:
+            return 3, "正在读取达妙驱动器量程和模式…", "", None
+        hint = "设定目标、速度上限和输出上限后使能。首次测试先用小限幅，电机固定好。"
+        if self.state == State.FAULT and self.last_status is not None and 0 < self.last_status[4] < len(RESULT):
+            hint = f"上次停止原因：{RESULT[self.last_status[4]]}。排除后可再次使能。"
+        return 4, hint, "使能并运行", self.run_motor
+
+    def update_guide(self):
+        step, hint, action, callback = self.guide_state()
+        for index, widget in enumerate(self.guide_steps):
+            stage = "done" if index < step else "now" if index == step else "todo"
+            if widget.property("stage") != stage:
+                widget.setProperty("stage", stage)
+                widget.style().unpolish(widget)
+                widget.style().polish(widget)
+            widget.setVisible(not self.narrow or index == step)
+        self.guide_hint.setText(hint)
+        self.guide_action.setText(action or "请稍候")
+        self.guide_callback = callback
+        busy = self.pending is not None and self.pending != Op.STOP and self.state != State.RUNNING
+        enabled = callback is not None and not busy
+        if callback == self.run_motor:
+            enabled = enabled and self.enable.isEnabled()
+        self.guide_action.setEnabled(enabled)
+        kind = "stop" if callback == self.stop_output else "guideAction"
+        if self.guide_action.objectName() != kind:
+            self.guide_action.setObjectName(kind)
+            self.guide_action.style().unpolish(self.guide_action)
+            self.guide_action.style().polish(self.guide_action)
+
+    def run_guide(self):
+        if self.guide_callback is not None:
+            self.guide_callback()
+
+    def show_readouts(self, data):
+        online = self.online
+        values = {
+            "speed": f"{real(data[7]):.1f}" if online else "—",
+            "pos": f"{real(data[8]):.1f}" if online else "—",
+            "effort": (f"{real(data[9]):.2f}" if self.brand == 1 else f"{real(data[9]):.0f}") if online else "—",
+            "temp": f"{real(data[10]):.0f}" if online and data[21] & 32 else "—",
+        }
+        for key, text in values.items():
+            self.readouts[key][0].setText(text)
+
+    # ---------------- 阶跃整定 ----------------
+    def start_step_test(self):
+        if self.state != State.RUNNING or self.pending is not None or self.last_status is None:
+            return
+        speed_mode = self.mode.currentIndex() == 0
+        base = real(self.last_status[24])
+        peak = base + self.step_amplitude.value()
+        limit = self.speed_limit.value() if speed_mode else 36000
+        if self.step_amplitude.value() == 0 or abs(peak) > limit:
+            self.notify(f"阶跃后的目标 {peak:g} 超出 ±{limit:g}，请减小幅值或提高速度上限。", True)
+            return
+        if not speed_mode and self.angle_enabled.isChecked() and not self.angle_min.value() <= peak <= self.angle_max.value():
+            self.notify("阶跃后的目标超出角度软限位。", True)
+            return
+        if self.pause.isChecked():
+            self.pause.setChecked(False)
+        self.step_test = {"base": base, "peak": peak, "hold": self.step_hold.value(), "speed": speed_mode,
+                          "phase": 0, "marks": [], "start": self.samples[-1][0] if self.samples else 0.0}
+        self.step_advice.hide()
+        self.step_result.setText(f"测试中：目标 {base:g} → {peak:g}，保持 {self.step_test['hold']:g} s…")
+        self.issue(Op.TARGET, (0, bits(peak)))
+
+    def step_next(self):
+        test = self.step_test
+        if test is None:
+            return
+        test["phase"] += 1
+        if test["phase"] == 1:
+            self.step_result.setText(f"测试中：回到 {test['base']:g}…")
+            self.issue(Op.TARGET, (0, bits(test["base"])))
+        else:
+            self.analyze_step(test)
+
+    def finish_step(self, message):
+        self.step_test = None
+        self.step_result.setText(message)
+        self.refresh_enabled()
+
+    def analyze_step(self, test):
+        column = 1 if test["speed"] else 2
+        target_column = 4 if test["speed"] else 5
+        rows = [row for row in self.samples if row[0] >= test["start"]]
+        software = self.strategy.currentIndex() == 0
+        limit = self.limit.value() if software else None
+
+        def edge(mark, old):
+            # 以给定离开旧值的首个采样为阶跃起点，退回到命令应答时刻。
+            for row in rows:
+                if row[0] >= mark - 0.5 and row[target_column] is not None and abs(row[target_column] - old) > 1e-6:
+                    return row[0]
+            return mark
+
+        up = edge(test["marks"][0], test["base"])
+        down = edge(test["marks"][1], test["peak"]) if len(test["marks"]) > 1 else rows[-1][0]
+        segment = [row for row in rows if up <= row[0] < down]
+        tail = [row for row in rows if row[0] >= down]
+        pick = lambda part, i: [row[i] for row in part]  # noqa: E731
+        rise = step_metrics(pick(segment, 0), pick(segment, column), up, test["base"], test["peak"],
+                            pick(segment, 6), limit)
+        fall = step_metrics(pick(tail, 0), pick(tail, column), down, test["peak"], test["base"], pick(tail, 6), limit)
+        unit = "rpm" if test["speed"] else "°"
+        reached = rise is not None and rise.rise_time is not None
+        fall_text = format_metrics(fall, unit) if reached else "上行未到位，不分析"
+        self.finish_step(f"上行：{format_metrics(rise, unit)}\n回落：{fall_text}")
+        loop = "速度环" if test["speed"] else "位置环"
+        tips = advice(rise, loop)
+        marks = {"ok": "✔", "warn": "⚠", "bad": "✖"}
+        self.step_advice.setText("\n".join(f"{marks[level]} {text}" for level, text in tips))
+        self.step_advice.show()
+        log.info("阶跃整定 %s %s", self.step_result.text().replace("\n", " | "), tips)
 
     def closeEvent(self, event):
         if self.flashing:
             event.ignore()
             self.notify("正在操作 Flash，请等待烧录和校验结束。")
             return
+        self.preferences.setValue("ui/geometry", self.saveGeometry())
+        self.preferences.setValue("ui/board", self.board.currentIndex())
+        self.preferences.setValue("ui/brand", self.brand)
+        self.preferences.setValue("ui/chartRange", self.window_range.currentIndex())
+        self.appearance.save(self.preferences)
+        log.info("退出")
         self.worker.send("quit")
         event.accept()
 
 
 def main():
+    applog.setup_logging()
+    applog.install_excepthook()
+    log.info("启动 电机测试台")
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     worker = ProbeWorker()
