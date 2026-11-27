@@ -108,3 +108,27 @@ def format_metrics(m: StepMetrics | None, unit=""):
         return "—" if v is None else f"{v * 1000:.0f} ms"
     return (f"幅值 {m.amplitude:.4g} {unit}  ·  上升 {ms(m.rise_time)}  ·  超调 {m.overshoot:.1f}%  ·  "
             f"调节 {ms(m.settling_time)}  ·  稳态误差 {m.steady_error:.1f}%  ·  {m.samples} 点")
+
+
+def detect_steps(t, target, min_jump, quiet=0.2, max_transition=0.1):
+    """在目标序列里找阶跃：两段平稳（持续 ≥ quiet 秒）之间跳变 ≥ min_jump，且过渡 ≤ max_transition 秒。
+    返回 [(t0, 旧值, 新值, 新平稳段结束时刻)]。用于实车上由遥控/状态机产生的目标阶跃的被动分析。"""
+    n = len(t)
+    if n < 3 or min_jump <= 0:
+        return []
+    tolerance = max(1e-9, abs(min_jump) * 0.02)
+    segments = []  # (起始下标, 结束下标, 值)
+    start = 0
+    for i in range(1, n + 1):
+        if i == n or target[i] is None or target[start] is None or abs(target[i] - target[start]) > tolerance:
+            if target[start] is not None and t[i - 1] - t[start] >= quiet:
+                segments.append((start, i - 1, target[start]))
+            start = i
+            if i < n and target[i] is None:
+                start = i + 1 if i + 1 < n else i
+    steps = []
+    for (a0, a1, va), (b0, b1, vb) in zip(segments, segments[1:]):
+        gap = t[b0] - t[a1]
+        if abs(vb - va) >= min_jump and gap <= max_transition + 1e-9 + (t[a1] - t[a1 - 1] if a1 else 0):
+            steps.append((t[a1 + 1], va, vb, t[b1]))
+    return steps

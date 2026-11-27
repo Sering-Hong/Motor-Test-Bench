@@ -59,3 +59,22 @@ def test_invalid_input():
     assert step_metrics([0, 1], [0, 1], 0, 0, 1) is None
     assert step_metrics([0, 1, 2, 3, 4], [0] * 5, 0, 5, 5) is None
     assert advice(None)[0][0] == "bad"
+
+
+def test_detect_steps_from_remote_like_target():
+    from analysis import detect_steps
+    t = [i * 0.01 for i in range(400)]
+    target = [0.0 if ti < 1.0 else 50.0 if ti < 2.5 else 50.0 + (ti - 2.5) * 10 if ti < 3.0 else 20.0 for ti in t]
+    steps = detect_steps(t, target, min_jump=10)
+    assert len(steps) == 1                     # 斜坡段不算阶跃，回落前没有平稳段
+    t0, old, new, end = steps[0]
+    assert abs(t0 - 1.0) < 0.011 and old == 0 and new == 50 and abs(end - 2.5) < 0.02
+
+
+def test_detect_steps_short_ramp_and_threshold():
+    from analysis import detect_steps
+    t = [i * 0.005 for i in range(600)]
+    target = [0.0 if ti < 1.0 else min(30.0, (ti - 1.0) * 600) for ti in t]  # 50 ms 过渡
+    steps = detect_steps(t, target, min_jump=10)
+    assert len(steps) == 1 and steps[0][2] == 30.0
+    assert detect_steps(t, target, min_jump=40) == []

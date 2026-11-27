@@ -18,6 +18,8 @@ enum Request {
     Close,
     Read { address: u64, count: usize },
     Write { address: u64, words: Vec<u32> },
+    // 按地址和长度选择 32/16/8 位访问，每个元素一次写入，避免改到相邻变量。
+    WriteBytes { address: u64, bytes: Vec<u8> },
     Flash { file: PathBuf },
     Quit,
 }
@@ -70,6 +72,21 @@ impl Bridge {
                 ensure!(words.len() <= MAX_WORDS && address % 4 == 0, "Invalid word write");
                 let mut core = self.session()?.core(0)?;
                 core.write_32(address, &words)?;
+                core.flush()?;
+                Ok(Value::Null)
+            }
+            Request::WriteBytes { address, bytes } => {
+                ensure!(!bytes.is_empty() && bytes.len() <= MAX_WORDS * 4, "Invalid byte write");
+                let mut core = self.session()?.core(0)?;
+                if address % 4 == 0 && bytes.len() % 4 == 0 {
+                    let words: Vec<u32> = bytes.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                    core.write_32(address, &words)?;
+                } else if address % 2 == 0 && bytes.len() % 2 == 0 {
+                    let halves: Vec<u16> = bytes.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+                    core.write_16(address, &halves)?;
+                } else {
+                    core.write_8(address, &bytes)?;
+                }
                 core.flush()?;
                 Ok(Value::Null)
             }

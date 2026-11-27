@@ -1,3 +1,5 @@
 PyQt5==5.15.11
 intelhex==2.3.0
 pyelftools==0.33
+pyqtgraph==0.14.0
+numpy==2.5.5

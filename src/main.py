@@ -17,6 +17,8 @@ from PyQt5.QtWidgets import (
 )
 
 from analysis import advice, format_metrics, step_metrics
+from live import LiveWorker
+from live_ui import LivePage
 from appearance import AppearanceDialog
 import applog
 from model import (
@@ -143,9 +145,10 @@ class SliderEditor(QWidget):
 
 
 class BenchWindow(QMainWindow):
-    def __init__(self, worker, preferences=None):
+    def __init__(self, worker, preferences=None, live_worker=None):
         super().__init__()
         self.worker = worker
+        self.live_worker = live_worker if live_worker is not None else LiveWorker()
         self.preferences = preferences if preferences is not None else QSettings("MotorBench", "MotorBench")
         self.flash_swd_khz = self.saved_rate("swd/flashKHz", SWD_RATES_KHZ, DEFAULT_SWD_KHZ)
         self.read_swd_khz = self.saved_rate("swd/readKHz", READ_SWD_RATES_KHZ, DEFAULT_SWD_KHZ)
@@ -199,6 +202,10 @@ class BenchWindow(QMainWindow):
         if geometry is not None:
             self.restoreGeometry(geometry)
         QShortcut(QKeySequence(Qt.Key_Escape), self, activated=self.escape_stop)
+        mode = self.preferences.value("ui/mode", 0, type=int)
+        if mode == 1:
+            self.mode_tabs.button(1).setChecked(True)
+            self.switch_mode(1, ask=False)
         self.timer = QTimer(self)
         self.timer.timeout.connect(worker.pulse)
         self.timer.start(50)
@@ -216,6 +223,10 @@ class BenchWindow(QMainWindow):
         top.addWidget(label("电机测试台", "product"))
         self.subtitle = label("CAN 调试与状态采集", "headnote")
         top.addWidget(self.subtitle)
+        top.addSpacing(12)
+        self.mode_bar, self.mode_tabs = tabs(("测试台", "实车调参"))
+        self.mode_bar.setToolTip("测试台：烧录测试固件单独测电机\n实车调参：附加到正在运行的整车程序，按变量名监视和改 PID")
+        top.addWidget(self.mode_bar)
         top.addStretch()
         self.connection = label("未连接", "connection")
         self.stop = button("停止输出 (Esc)", "stop")
@@ -240,7 +251,17 @@ class BenchWindow(QMainWindow):
         workspace_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         workspace_scroll.setWidget(body)
         workspace_scroll.viewport().setAutoFillBackground(False)
-        shell.addWidget(workspace_scroll, 1)
+        self.pages = QStackedWidget()
+        self.pages.addWidget(workspace_scroll)
+        self.live = LivePage(self.live_worker, self.preferences, self.live_notify)
+        self.pages.addWidget(self.live)
+        shell.addWidget(self.pages, 1)
+        self.toast = QLabel(self.background)
+        self.toast.setObjectName("toast")
+        self.toast.setWordWrap(True)
+        self.toast.hide()
+        self.toast_timer = QTimer(self, singleShot=True)
+        self.toast_timer.timeout.connect(self.toast.hide)
         toolbar, self.toolbar_layout = box("toolbar", QGridLayout, 10)
         toolbar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
         self.board = combo([b.name for b in BOARDS])
@@ -308,6 +329,7 @@ class BenchWindow(QMainWindow):
         self.header_icon.setPixmap(self.brand_icon.pixmap(icon_size, icon_size))
         for chart in self.charts:
             chart.set_zoom(self.scale)
+        self.live.set_scale(self.scale)
         self.table.verticalHeader().setDefaultSectionSize(round(29 * self.scale))
         self.reflow(force=True)
 
@@ -315,6 +337,49 @@ class BenchWindow(QMainWindow):
         super().resizeEvent(event)
         if hasattr(self, "panels"):
             self.reflow()
+        if hasattr(self, "toast") and self.toast.isVisible():
+            self.place_toast()
+
+    # ---------------- 模式与提示 ----------------
+    def switch_mode(self, index, ask=True):
+        if index == self.pages.currentIndex():
+            return
+        if index == 1 and self.connected:
+            if ask and QMessageBox.question(self, "切换到实车调参",
+                                            "实车调参需要独占探针，将先停止输出并断开测试台连接。继续？") != QMessageBox.Yes:
+                self.mode_tabs.button(0).setChecked(True)
+                return
+            self.worker.send("disconnect")
+        if index == 0 and self.live.connected:
+            self.live_worker.send("disconnect")
+        self.pages.setCurrentIndex(index)
+        self.preferences.setValue("ui/mode", index)
+        live = index == 1
+        self.stop.setVisible(not live)
+        self.connection.setVisible(not live)
+        self.subtitle.setText("整车 SWD 在线监视与调参" if live else "CAN 调试与状态采集")
+        if live and self.live.probe.currentData() is None:
+            self.live_worker.send("list")
+
+    def live_notify(self, message, error=False):
+        (log.warning if error else log.info)(message)
+        self.show_toast(message, error)
+
+    def show_toast(self, message, error=False):
+        self.toast.setText(message)
+        self.toast.setProperty("error", "true" if error else "false")
+        self.toast.style().unpolish(self.toast)
+        self.toast.style().polish(self.toast)
+        self.toast.show()
+        self.toast.raise_()
+        self.place_toast()
+        self.toast_timer.start(7000 if error else 3500)
+
+    def place_toast(self):
+        width = min(round(720 * self.scale), self.background.width() - 40)
+        self.toast.setFixedWidth(width)
+        self.toast.adjustSize()
+        self.toast.move((self.background.width() - width) // 2, self.background.height() - self.toast.height() - 24)
 
     def reflow(self, force=False):
         narrow = self.width() < round(1100 * self.scale)
@@ -627,6 +692,7 @@ class BenchWindow(QMainWindow):
         self.appearance_button.clicked.connect(self.open_appearance)
         self.help_button.clicked.connect(self.open_help)
         self.guide_action.clicked.connect(self.run_guide)
+        self.mode_tabs.idClicked.connect(self.switch_mode)
         self.table.itemDoubleClicked.connect(lambda *_: self.select_button.isEnabled() and self.select_row())
         self.apply_tune_button.clicked.connect(self.apply_tune)
         self.reset_tune.clicked.connect(self.reset_profile)
@@ -849,6 +915,8 @@ class BenchWindow(QMainWindow):
 
     def notify(self, message, error=False):
         (log.warning if error else log.info)(message)
+        if error and hasattr(self, "toast"):
+            self.show_toast(message, True)
         self.notice.setText(message)
         self.notice.setObjectName("alert" if error else "muted")
         self.notice.style().unpolish(self.notice)
@@ -1062,7 +1130,9 @@ class BenchWindow(QMainWindow):
         self.issue(Op.STOP)
 
     def escape_stop(self):
-        if self.ready and not self.flashing:
+        if self.pages.currentIndex() == 1:
+            self.live.escape()
+        elif self.ready and not self.flashing:
             self.stop_output()
 
     def change_mode(self, *_):
@@ -1561,6 +1631,7 @@ class BenchWindow(QMainWindow):
         self.preferences.setValue("ui/chartRange", self.window_range.currentIndex())
         self.appearance.save(self.preferences)
         log.info("退出")
+        self.live.shutdown()
         self.worker.send("quit")
         event.accept()
 
@@ -1572,12 +1643,15 @@ def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     worker = ProbeWorker()
-    window = BenchWindow(worker)
+    live_worker = LiveWorker()
+    window = BenchWindow(worker, live_worker=live_worker)
     worker.start()
+    live_worker.start()
     worker.send("list")
     window.show()
     code = app.exec()
     worker.join(timeout=2.0)
+    live_worker.join(timeout=2.0)
     return code
 
 

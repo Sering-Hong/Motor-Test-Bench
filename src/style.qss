@@ -42,7 +42,10 @@ QPushButton[tab="true"]:checked { background: ${accent_soft}; border-color: ${ac
 QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit, QTextBrowser { min-height: 29px; border: 1px solid ${border}; border-radius: 6px; background: ${field}; padding: 0 5px; selection-background-color: ${accent}; selection-color: ${accent_on}; }
 QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QLineEdit:focus { border-color: ${accent}; }
 QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QLineEdit:disabled { background: ${disabled_bg}; color: ${disabled_text}; }
-QDoubleSpinBox[dirty="true"] { background: ${dirty_bg}; }
+QDoubleSpinBox[dirty="true"], QLineEdit[dirty="true"] { background: ${dirty_bg}; }
+QLabel#toast { background: ${menu}; color: ${text}; border: 1px solid ${accent}; border-radius: 10px; padding: 10px 16px; font-size: 13px; }
+QLabel#toast[error="true"] { border: 2px solid ${danger}; color: ${danger}; font-weight: 600; }
+QTreeWidget { border: 1px solid ${border}; border-radius: 7px; background: ${field}; alternate-background-color: ${field_alt}; selection-background-color: ${accent_soft}; selection-color: ${text}; }
 QComboBox QAbstractItemView { background: ${menu}; border: 1px solid ${border}; selection-background-color: ${accent}; selection-color: ${accent_on}; }
 QCheckBox { spacing: 6px; background: transparent; }
 QCheckBox::indicator { width: 14px; height: 14px; background: ${field}; border: 1px solid ${border_strong}; border-radius: 3px; }
